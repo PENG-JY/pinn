@@ -30,6 +30,8 @@ class physics_informed_nn_wd:
                  w_sob=0.01, w_mean=0.10):
 
         self.lb, self.ub   = lb, ub
+        self.lb_tf = tf.constant(lb, dtype=tf.float32)
+        self.ub_tf = tf.constant(ub, dtype=tf.float32)
         self.w_sob         = w_sob
         self.w_mean        = w_mean
 
@@ -83,42 +85,68 @@ class physics_informed_nn_wd:
         return tf.clip_by_value(u_raw + self.u_base, 0.0, self.upper_bound)
 
     def net_Eq(self, s1, s2, s3, t):
-        """Black-Scholes PDE residual.
+        """Black-Scholes PDE residual in raw (unnormalized) coordinates.
 
-        Uses nested tapes: outer (persistent) records the inner gradient
-        computation, enabling efficient second-order derivatives without
-        the 'gradient inside context' warning.
+        Network inputs s1, s2, s3, t are normalised to [-1, 1], but the PDE
+        coefficients (sigma*S_i) use raw asset prices S_i ∈ [lb, ub].
+        Chain-rule scaling converts tape-computed derivatives from normalised
+        to raw coordinates before substituting into the PDE.
+
+            ∂u/∂S_i = (∂u/∂s_i) * c_i,   c_i = 2 / (ub_i - lb_i)
+            ∂²u/∂S_i² = (∂²u/∂s_i²) * c_i²
+            ∂²u/∂S_i∂S_j = (∂²u/∂s_i∂s_j) * c_i * c_j
         """
-        with tf.GradientTape(persistent=True) as outer:
-            with tf.GradientTape() as inner:
-                inner.watch([s1, s2, s3, t])
-                X = tf.concat([s1, s2, s3, t], axis=1)
-                u = self._call_net(X)
-            # First-order gradients computed inside outer context so outer
-            # tape records these ops and can differentiate through them.
-            grads1 = inner.gradient(u, [s1, s2, s3, t])
+        lb = self.lb_tf
+        ub = self.ub_tf
+        # Scale factors: derivative w.r.t. raw coord = deriv w.r.t. norm * c
+        c1 = 2.0 / (ub[0] - lb[0])
+        c2 = 2.0 / (ub[1] - lb[1])
+        c3 = 2.0 / (ub[2] - lb[2])
+        ct = 2.0 / (ub[3] - lb[3])
+
+        with tf.GradientTape(persistent=True) as tape:
+            tape.watch([s1, s2, s3, t])
+            X = tf.concat([s1, s2, s3, t], axis=1)
+            u = self._call_net(X)
+            # Computed inside context so tape records these ops for 2nd-order
+            grads1 = tape.gradient(u, [s1, s2, s3, t])
             u_s1, u_s2, u_s3, u_t = grads1
 
-        u_s1s1 = outer.gradient(u_s1, s1)
-        u_s2s2 = outer.gradient(u_s2, s2)
-        u_s3s3 = outer.gradient(u_s3, s3)
-        u_s1s2 = outer.gradient(u_s1, s2)
-        u_s1s3 = outer.gradient(u_s1, s3)
-        u_s2s3 = outer.gradient(u_s2, s3)
-        del outer
+        u_s1s1 = tape.gradient(u_s1, s1)
+        u_s2s2 = tape.gradient(u_s2, s2)
+        u_s3s3 = tape.gradient(u_s3, s3)
+        u_s1s2 = tape.gradient(u_s1, s2)
+        u_s1s3 = tape.gradient(u_s1, s3)
+        u_s2s3 = tape.gradient(u_s2, s3)
+        del tape
+
+        # Raw asset prices from normalised inputs
+        S1 = (s1 + 1.0) / c1 + lb[0]
+        S2 = (s2 + 1.0) / c2 + lb[1]
+        S3 = (s3 + 1.0) / c3 + lb[2]
+
+        # Chain-rule-corrected derivatives w.r.t. raw coordinates
+        u_S1 = u_s1 * c1;   u_S2 = u_s2 * c2;   u_S3 = u_s3 * c3
+        u_T  = u_t  * ct
+        u_S1S1 = u_s1s1 * c1**2
+        u_S2S2 = u_s2s2 * c2**2
+        u_S3S3 = u_s3s3 * c3**2
+        u_S1S2 = u_s1s2 * c1 * c2
+        u_S1S3 = u_s1s3 * c1 * c3
+        u_S2S3 = u_s2s3 * c2 * c3
 
         sig1, sig2, sig3 = self.sigma1, self.sigma2, self.sigma3
         return (
-            u_t
-            + 0.5 * (sig1**2 * s1**2 * u_s1s1
-                   + sig2**2 * s2**2 * u_s2s2
-                   + sig3**2 * s3**2 * u_s3s3
-                   + 2 * sig1 * sig2 * s1 * s2 * u_s1s2
-                   + 2 * sig1 * sig3 * s1 * s3 * u_s1s3
-                   + 2 * sig2 * sig3 * s2 * s3 * u_s2s3)
-            + (self.r - self.q1) * s1 * u_s1
-            + (self.r - self.q2) * s2 * u_s2
-            + (self.r - self.q3) * s3 * u_s3
+            u_T
+            + 0.5 * (sig1**2 * S1**2 * u_S1S1
+                   + sig2**2 * S2**2 * u_S2S2
+                   + sig3**2 * S3**2 * u_S3S3
+                   + 2 * sig1 * sig2 * S1 * S2 * u_S1S2
+                   + 2 * sig1 * sig3 * S1 * S3 * u_S1S3
+                   + 2 * sig2 * sig3 * S2 * S3 * u_S2S3)
+            + (self.r - self.q1) * S1 * u_S1
+            + (self.r - self.q2) * S2 * u_S2
+            + (self.r - self.q3) * S3 * u_S3
             - self.r * u
         )
 
