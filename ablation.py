@@ -123,10 +123,8 @@ N_BC   = 1000
 # ── 1. Ablation ───────────────────────────────────────────────────────────────
 
 ABLATION_CONFIGS = [
-    ("A: Baseline",  0.0,   0.0 ),   # standard PINN, no extra terms
-    ("B: +Sobolev",  0.01,  0.0 ),   # add gradient-norm regularisation only
-    ("C: +Mean",     0.0,   0.1 ),   # add mean-guidance only
-    ("D: Full",      0.01,  0.1 ),   # both terms (paper default)
+    ("B: +Sobolev",  0.01,  0.0 ),   # gradient-norm regularisation only
+    ("C: +Mean",     0.0,   0.1 ),   # mean-guidance only
 ]
 
 print("=" * 60)
