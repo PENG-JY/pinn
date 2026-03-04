@@ -27,13 +27,14 @@ class physics_informed_nn_wd:
                  X_term, u_term,
                  X_bc1, u_bc1,
                  X_bc2, u_bc2,
-                 w_sob=0.01, w_mean=0.10):
+                 w_sob=0.01, w_mean=0.10, w_bc=0.1):
 
         self.lb, self.ub   = lb, ub
         self.lb_tf = tf.constant(lb, dtype=tf.float32)
         self.ub_tf = tf.constant(ub, dtype=tf.float32)
         self.w_sob         = w_sob
         self.w_mean        = w_mean
+        self.w_bc          = w_bc
 
         # Output clamping: shifts initial prediction to mid-range so the
         # network cannot trivially collapse to u=0 (original approach).
@@ -181,7 +182,8 @@ class physics_informed_nn_wd:
         # Penalises systematic bias in the predicted mean, improving calibration.
         loss_mean = tf.square(tf.reduce_mean(u_term) - tf.reduce_mean(self.u2))
 
-        total = (loss_pde + loss_term + loss_bc1 + loss_bc2
+        total = (loss_pde + loss_term
+                 + self.w_bc   * (loss_bc1 + loss_bc2)
                  + self.w_sob  * loss_sob
                  + self.w_mean * loss_mean)
         return total, loss_pde, loss_term, loss_bc1, loss_bc2
