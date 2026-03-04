@@ -33,8 +33,10 @@ class physics_informed_nn_wd:
         self.w_sob         = w_sob
         self.w_mean        = w_mean
 
-        # Upper bound for output clamping (prevents trivial u=0 collapse)
-        self.upper_bound = float(np.max(u_col)) * 1.5 + 1e-6
+        # Output clamping: shifts initial prediction to mid-range so the
+        # network cannot trivially collapse to u=0 (original approach).
+        self.upper_bound = float(np.max(u_col)) + 1.0
+        self.u_base      = self.upper_bound * 0.5
 
         def t(arr): return tf.cast(tf.convert_to_tensor(arr), tf.float32)
 
@@ -70,25 +72,40 @@ class physics_informed_nn_wd:
     # ── Forward pass ──────────────────────────────────────────────────────────
 
     def _call_net(self, X):
-        """Evaluate network with softplus output to ensure u >= 0."""
-        return tf.nn.softplus(self.Neural_Net(X))
+        """Evaluate network with output shifted to mid-range and clamped.
+
+        u = clip(u_raw + u_base, 0, upper_bound)
+
+        The u_base shift means the network starts at ~upper_bound/2,
+        making it impossible to trivially satisfy the PDE with u≈0.
+        """
+        u_raw = self.Neural_Net(X)
+        return tf.clip_by_value(u_raw + self.u_base, 0.0, self.upper_bound)
 
     def net_Eq(self, s1, s2, s3, t):
-        """Black-Scholes PDE residual using a single persistent tape."""
-        with tf.GradientTape(persistent=True) as tape:
-            tape.watch([s1, s2, s3, t])
-            X = tf.concat([s1, s2, s3, t], axis=1)
-            u = self._call_net(X)
-            grads1 = tape.gradient(u, [s1, s2, s3, t])
+        """Black-Scholes PDE residual.
+
+        Uses nested tapes: outer (persistent) records the inner gradient
+        computation, enabling efficient second-order derivatives without
+        the 'gradient inside context' warning.
+        """
+        with tf.GradientTape(persistent=True) as outer:
+            with tf.GradientTape() as inner:
+                inner.watch([s1, s2, s3, t])
+                X = tf.concat([s1, s2, s3, t], axis=1)
+                u = self._call_net(X)
+            # First-order gradients computed inside outer context so outer
+            # tape records these ops and can differentiate through them.
+            grads1 = inner.gradient(u, [s1, s2, s3, t])
             u_s1, u_s2, u_s3, u_t = grads1
 
-        u_s1s1 = tape.gradient(u_s1, s1)
-        u_s2s2 = tape.gradient(u_s2, s2)
-        u_s3s3 = tape.gradient(u_s3, s3)
-        u_s1s2 = tape.gradient(u_s1, s2)
-        u_s1s3 = tape.gradient(u_s1, s3)
-        u_s2s3 = tape.gradient(u_s2, s3)
-        del tape
+        u_s1s1 = outer.gradient(u_s1, s1)
+        u_s2s2 = outer.gradient(u_s2, s2)
+        u_s3s3 = outer.gradient(u_s3, s3)
+        u_s1s2 = outer.gradient(u_s1, s2)
+        u_s1s3 = outer.gradient(u_s1, s3)
+        u_s2s3 = outer.gradient(u_s2, s3)
+        del outer
 
         sig1, sig2, sig3 = self.sigma1, self.sigma2, self.sigma3
         return (
