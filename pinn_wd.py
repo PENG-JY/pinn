@@ -33,6 +33,9 @@ class physics_informed_nn_wd:
         self.w_sob         = w_sob
         self.w_mean        = w_mean
 
+        # Upper bound for output clamping (prevents trivial u=0 collapse)
+        self.upper_bound = float(np.max(u_col)) * 1.5 + 1e-6
+
         def t(arr): return tf.cast(tf.convert_to_tensor(arr), tf.float32)
 
         # Interior collocation points (PDE residual + L2 monitoring)
@@ -51,11 +54,13 @@ class physics_informed_nn_wd:
         self.p    = t(X_term[:, 3:4])
         self.u2   = t(u_term)
 
-        # Boundary conditions
+        # Boundary conditions (store full tensors for direct Neural_Net calls)
+        self.X_bc1  = t(X_bc1)
         self.bc1_s1 = t(X_bc1[:, 0:1]);  self.bc1_s2 = t(X_bc1[:, 1:2])
         self.bc1_s3 = t(X_bc1[:, 2:3]);  self.bc1_t  = t(X_bc1[:, 3:4])
         self.u_bc1  = t(u_bc1)
 
+        self.X_bc2  = t(X_bc2)
         self.bc2_s1 = t(X_bc2[:, 0:1]);  self.bc2_s2 = t(X_bc2[:, 1:2])
         self.bc2_s3 = t(X_bc2[:, 2:3]);  self.bc2_t  = t(X_bc2[:, 3:4])
         self.u_bc2  = t(u_bc2)
@@ -64,28 +69,26 @@ class physics_informed_nn_wd:
 
     # ── Forward pass ──────────────────────────────────────────────────────────
 
-    def net_u(self, s1, s2, s3, t):
-        """Evaluate u and its first-order partial derivatives."""
-        X = tf.concat([s1, s2, s3, t], axis=1)
-        with tf.GradientTape(persistent=True) as tape:
-            tape.watch(X)
-            u = self.Neural_Net(X)
-        dX = tape.gradient(u, X)
-        del tape
-        return u, dX[:, 0:1], dX[:, 1:2], dX[:, 2:3], dX[:, 3:4]
+    def _call_net(self, X):
+        """Evaluate network with softplus output to ensure u >= 0."""
+        return tf.nn.softplus(self.Neural_Net(X))
 
     def net_Eq(self, s1, s2, s3, t):
-        """Black-Scholes PDE residual at given collocation points."""
-        with tf.GradientTape(persistent=True) as D2:
-            D2.watch([s1, s2, s3])
-            u, u_s1, u_s2, u_s3, u_t = self.net_u(s1, s2, s3, t)
-        u_s1s1 = D2.gradient(u_s1, s1)
-        u_s2s2 = D2.gradient(u_s2, s2)
-        u_s3s3 = D2.gradient(u_s3, s3)
-        u_s1s2 = D2.gradient(u_s1, s2)
-        u_s1s3 = D2.gradient(u_s1, s3)
-        u_s2s3 = D2.gradient(u_s2, s3)
-        del D2
+        """Black-Scholes PDE residual using a single persistent tape."""
+        with tf.GradientTape(persistent=True) as tape:
+            tape.watch([s1, s2, s3, t])
+            X = tf.concat([s1, s2, s3, t], axis=1)
+            u = self._call_net(X)
+            grads1 = tape.gradient(u, [s1, s2, s3, t])
+            u_s1, u_s2, u_s3, u_t = grads1
+
+        u_s1s1 = tape.gradient(u_s1, s1)
+        u_s2s2 = tape.gradient(u_s2, s2)
+        u_s3s3 = tape.gradient(u_s3, s3)
+        u_s1s2 = tape.gradient(u_s1, s2)
+        u_s1s3 = tape.gradient(u_s1, s3)
+        u_s2s3 = tape.gradient(u_s2, s3)
+        del tape
 
         sig1, sig2, sig3 = self.sigma1, self.sigma2, self.sigma3
         return (
@@ -111,21 +114,21 @@ class physics_informed_nn_wd:
         loss_pde = tf.reduce_mean(tf.square(eq))
 
         # Terminal condition
-        u_term, *_ = self.net_u(self.l1, self.l2, self.l3, self.p)
-        loss_term  = tf.reduce_mean(tf.square(self.u2 - u_term))
+        u_term = self._call_net(self.X2)
+        loss_term = tf.reduce_mean(tf.square(self.u2 - u_term))
 
         # Boundary conditions
-        u_bc1, *_ = self.net_u(self.bc1_s1, self.bc1_s2, self.bc1_s3, self.bc1_t)
-        u_bc2, *_ = self.net_u(self.bc2_s1, self.bc2_s2, self.bc2_s3, self.bc2_t)
-        loss_bc1  = tf.reduce_mean(tf.square(self.u_bc1 - u_bc1))
-        loss_bc2  = tf.reduce_mean(tf.square(self.u_bc2 - u_bc2))
+        u_bc1 = self._call_net(self.X_bc1)
+        u_bc2 = self._call_net(self.X_bc2)
+        loss_bc1 = tf.reduce_mean(tf.square(self.u_bc1 - u_bc1))
+        loss_bc2 = tf.reduce_mean(tf.square(self.u_bc2 - u_bc2))
 
         # Sobolev regularisation: gradient-norm penalty at terminal points.
         # Theoretical basis: the exact solution u ∈ H^1(Ω); penalising ||∇u||^2
         # at the terminal surface enforces smoothness (Czarnecki et al., 2017).
         with tf.GradientTape() as tape:
             tape.watch(self.X2)
-            u_sob = self.Neural_Net(self.X2)
+            u_sob = self._call_net(self.X2)
         g = tape.gradient(u_sob, self.X2)
         loss_sob = tf.reduce_mean(tf.square(g)) if g is not None else 0.0
 
@@ -206,7 +209,7 @@ class physics_informed_nn_wd:
     def predict(self, X_star):
         """Return network prediction as a numpy array."""
         X = tf.cast(X_star, tf.float32)
-        return self.Neural_Net(X).numpy()
+        return self._call_net(X).numpy()
 
     # ── Diagnostics ───────────────────────────────────────────────────────────
 
